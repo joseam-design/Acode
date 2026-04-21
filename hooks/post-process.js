@@ -2,6 +2,8 @@
 const path = require('path');
 const fs = require('fs');
 const { execSync } = require('child_process');
+const os = require('os');
+
 
 const buildFilePath = path.resolve(__dirname, '../build.json');
 const copyToPath = path.resolve(__dirname, '../platforms/android/build.json');
@@ -31,26 +33,23 @@ patchTargetSdkVersion();
 enableKeyboardWorkaround();
 
 
+
+
+
 function getTmpDir() {
-  const tmpdirEnv = process.env.TMPDIR;
+  const tmpdirEnv = process.env.TMPDIR || os.tmpdir();
 
   if (tmpdirEnv) {
     try {
       fs.accessSync(tmpdirEnv, fs.constants.R_OK | fs.constants.W_OK);
       return tmpdirEnv;
     } catch {
-      // TMPDIR exists but not accessible
+      // tmpdirEnv exists but not accessible
     }
   }
 
-  try {
-    fs.accessSync("/tmp", fs.constants.R_OK | fs.constants.W_OK);
-    return "/tmp";
-  } catch {
-    console.log("Error: No usable temporary directory found (TMPDIR or /tmp not accessible).");
-    return null;
-    // process.exit(1);
-  }
+  console.log("Error: No usable temporary directory found (TMPDIR or os.tmpdir() not accessible).");
+  return null;
 }
 
 function patchTargetSdkVersion() {
