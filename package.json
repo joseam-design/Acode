@@ -25,7 +25,9 @@
     "plugins": {
       "cordova-clipboard": {},
       "cordova-plugin-device": {},
-      "cordova-plugin-file": {},
+      "cordova-plugin-file": {
+        "ANDROIDX_WEBKIT_VERSION": "1.4.0"
+      },
       "cordova-plugin-server": {},
       "cordova-plugin-ftp": {},
       "cordova-plugin-sdcard": {},
@@ -132,7 +134,7 @@
     "@codemirror/language-data": "^6.5.2",
     "@codemirror/legacy-modes": "^6.5.2",
     "@codemirror/lint": "^6.9.5",
-    "@codemirror/lsp-client": "^6.2.2",
+    "@codemirror/lsp-client": "^6.2.3",
     "@codemirror/search": "^6.6.0",
     "@codemirror/state": "^6.6.0",
     "@codemirror/theme-one-dark": "^6.1.3",

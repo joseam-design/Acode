@@ -24,6 +24,77 @@ interface TransportInterface extends Transport {
 	unsubscribe(handler: MessageListener): void;
 }
 
+/**
+ * Parsea uno o más mensajes LSP del buffer acumulado.
+ *
+ * El protocolo base de LSP (spec Microsoft) exige framing con Content-Length
+ * tanto para envío como para recepción, independientemente del transporte
+ * (WebSocket, stdio, TCP). Sin este parsing, los diagnósticos (líneas rojas),
+ * autocompletado y hover fallan en todos los servidores estrictos como
+ * Dart/Flutter, y pueden fallar intermitentemente en TS/Python con mensajes
+ * grandes o fragmentados en múltiples frames WebSocket.
+ *
+ * @returns parsed    - cuerpos JSON completos listos para despachar a listeners
+ * @returns remaining - fragmento incompleto que debe quedar en el buffer
+ *                      hasta el próximo frame WebSocket
+ */
+function parseLspMessages(buffer: string): {
+	parsed: string[];
+	remaining: string;
+} {
+	const parsed: string[] = [];
+	const HEADER_SEP = "\r\n\r\n";
+	let pos = 0;
+
+	while (pos < buffer.length) {
+		const sepIdx = buffer.indexOf(HEADER_SEP, pos);
+
+		if (sepIdx === -1) {
+			// Sin separador de header: puede ser JSON plano (backward compat con
+			// servidores que no usan Content-Length) o un fragmento incompleto.
+			const fragment = buffer.substring(pos).trim();
+			if (fragment.startsWith("{")) {
+				try {
+					JSON.parse(fragment);
+					parsed.push(fragment);
+					pos = buffer.length;
+				} catch {
+					// Fragmento incompleto — retener en buffer hasta el próximo frame
+				}
+			}
+			break;
+		}
+
+		// Hay separador: extraer valor de Content-Length del header
+		const headerPart = buffer.substring(pos, sepIdx);
+		const match = /Content-Length:\s*(\d+)/i.exec(headerPart);
+
+		if (!match) {
+			// Header presente pero sin Content-Length — protocolo inesperado,
+			// saltar este bloque e intentar el siguiente
+			pos = sepIdx + HEADER_SEP.length;
+			continue;
+		}
+
+		const contentLength = parseInt(match[1], 10);
+		const bodyStart = sepIdx + HEADER_SEP.length;
+		const bodyEnd = bodyStart + contentLength;
+
+		if (bodyEnd > buffer.length) {
+			// Mensaje incompleto — retener desde pos en buffer
+			break;
+		}
+
+		parsed.push(buffer.substring(bodyStart, bodyEnd));
+		pos = bodyEnd;
+	}
+
+	return {
+		parsed,
+		remaining: pos < buffer.length ? buffer.substring(pos) : "",
+	};
+}
+
 function createWebSocketTransport(
 	server: LspServerDefinition,
 	context: TransportContext,
@@ -69,7 +140,38 @@ function createWebSocketTransport(
 	let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	let connected = false;
 
+	// Buffer acumulador: los mensajes LSP pueden llegar fragmentados en múltiples
+	// frames WebSocket, o varios mensajes pueden llegar en un mismo frame.
+	// Sin este buffer, parseLspMessages solo vería fragmentos y descartaría datos.
+	let messageBuffer = "";
+
+	// NOTA: `encoder` se mantiene igual que en el original (línea 72).
+	// sendFramed() usa su propio TextEncoder local para evitar variable shadow.
 	const encoder = binaryMode ? new TextEncoder() : null;
+
+	/**
+	 * Envía un mensaje LSP con el framing Content-Length requerido por el
+	 * protocolo base de LSP (https://microsoft.github.io/language-server-protocol/
+	 * specifications/lsp/3.17/specification/#baseProtocol).
+	 *
+	 * IMPORTANTE: Content-Length debe indicar el tamaño en BYTES UTF-8 del body,
+	 * no la longitud de la cadena JS (que cuenta code units y difiere para
+	 * caracteres multibyte como emoji o CJK).
+	 *
+	 * Se usa en dos lugares:
+	 *   1. transportInterface.send() — mensajes del cliente al servidor
+	 *   2. dispatchToListeners() — auto-respuesta a window/workDoneProgress/create
+	 */
+	function sendFramed(message: string): void {
+		const utf8Encoder = new TextEncoder();
+		const bodyBytes = utf8Encoder.encode(message);
+		const framedMessage = `Content-Length: ${bodyBytes.length}\r\n\r\n${message}`;
+		if (binaryMode && encoder) {
+			socket!.send(utf8Encoder.encode(framedMessage));
+		} else {
+			socket!.send(framedMessage);
+		}
+	}
 
 	function createSocket(): WebSocket {
 		try {
@@ -88,32 +190,45 @@ function createWebSocketTransport(
 		}
 	}
 
+	/**
+	 * Extrae mensajes LSP completos del buffer acumulado y los despacha.
+	 * Actualiza messageBuffer con el fragmento incompleto restante (si hay).
+	 */
+	function flushLspBuffer(): void {
+		const result = parseLspMessages(messageBuffer);
+		if (result.parsed.length > 0) {
+			result.parsed.forEach((msg) => dispatchToListeners(msg));
+		}
+		messageBuffer = result.remaining;
+	}
+
 	function handleMessage(event: MessageEvent): void {
-		let data: string;
 		if (typeof event.data === "string") {
-			data = event.data;
+			messageBuffer += event.data;
+			flushLspBuffer();
 		} else if (event.data instanceof Blob) {
 			// Handle Blob synchronously by queuing - avoids async ordering issues
 			event.data
 				.text()
 				.then((text: string) => {
-					dispatchToListeners(text);
+					messageBuffer += text;
+					flushLspBuffer();
 				})
 				.catch((err: Error) => {
 					console.error("Failed to read Blob message", err);
 				});
-			return;
 		} else if (event.data instanceof ArrayBuffer) {
-			data = new TextDecoder().decode(event.data);
+			messageBuffer += new TextDecoder().decode(event.data);
+			flushLspBuffer();
 		} else {
 			console.warn(
 				"Unknown WebSocket message type",
 				typeof event.data,
 				event.data,
 			);
-			data = String(event.data);
+			messageBuffer += String(event.data);
+			flushLspBuffer();
 		}
-		dispatchToListeners(data);
 	}
 
 	function dispatchToListeners(data: string): void {
@@ -143,11 +258,9 @@ function createWebSocketTransport(
 					console.debug(`[LSP:${server.id}] => (auto-response)`, response);
 				}
 				if (socket && socket.readyState === WebSocket.OPEN) {
-					if (binaryMode && encoder) {
-						socket.send(encoder.encode(response));
-					} else {
-						socket.send(response);
-					}
+					// Usar sendFramed: la auto-respuesta también debe llevar Content-Length
+					// (el send directo previo era otro punto donde se enviaba JSON plano)
+					sendFramed(response);
 				}
 				// Don't pass this request to listeners since we handled it
 				console.info(
@@ -170,6 +283,7 @@ function createWebSocketTransport(
 
 	function handleClose(event: CloseEvent): void {
 		connected = false;
+		messageBuffer = ""; // Descartar datos incompletos al cerrar la conexión
 		if (disposed) return;
 
 		const wasClean = event.wasClean || event.code === 1000;
@@ -227,6 +341,7 @@ function createWebSocketTransport(
 			socket.onopen = () => {
 				connected = true;
 				reconnectAttempts = 0;
+				messageBuffer = ""; // Limpiar buffer también al reconectar
 				console.info(`[LSP:${server.id}] Reconnected successfully`);
 				if (socket) {
 					socket.onopen = null;
@@ -292,11 +407,10 @@ function createWebSocketTransport(
 			if (!connected || !socket || socket.readyState !== WebSocket.OPEN) {
 				throw new Error("WebSocket transport is not open");
 			}
-			if (binaryMode && encoder) {
-				socket.send(encoder.encode(message));
-			} else {
-				socket.send(message);
+			if (context?.debugWebSocket) {
+				console.debug(`[LSP:${server.id}] =>`, message);
 			}
+			sendFramed(message);
 		},
 		subscribe(handler: MessageListener): void {
 			listeners.add(handler);
@@ -309,6 +423,7 @@ function createWebSocketTransport(
 	const dispose = (): void => {
 		disposed = true;
 		connected = false;
+		messageBuffer = ""; // Limpiar buffer al destruir el transport
 
 		if (reconnectTimer) {
 			clearTimeout(reconnectTimer);
